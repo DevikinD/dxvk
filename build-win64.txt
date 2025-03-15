@@ -6,7 +6,7 @@ strip = 'strip'
 windres = 'arm64ec-w64-mingw32-windres'
 ld = 'arm64ec-w64-mingw32-ld'
 widl = 'arm64ec-w64-mingw32-widl'
-pkgconfig = 'aarch64-linux-gnu-pkg-config'
+pkg-config = 'aarch64-linux-gnu-pkg-config'
 
 [host_machine]
 system = 'windows'
