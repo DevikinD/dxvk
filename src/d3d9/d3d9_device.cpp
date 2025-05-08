@@ -82,9 +82,7 @@ namespace dxvk {
       ctx->beginRecording(cDevice->createCommandList());
 
       // Disable logic op once and for all.
-      DxvkLogicOpState loState;
-      loState.enableLogicOp = VK_FALSE;
-      loState.logicOp       = VK_LOGIC_OP_CLEAR;
+      DxvkLogicOpState loState = { };
       ctx->setLogicOpState(loState);
     });
 
@@ -195,6 +193,11 @@ namespace dxvk {
     m_activeRTsWhichAreTextures = 0;
     m_alphaSwizzleRTs = 0;
     m_lastHazardsRT = 0;
+
+    // Determine used vendor ID
+    D3DADAPTER_IDENTIFIER9 adapterId9;
+    HRESULT res = m_adapter->GetAdapterIdentifier(0, &adapterId9);
+    m_vendorId = SUCCEEDED(res) ? adapterId9.VendorId : 0;
   }
 
 
@@ -1226,9 +1229,12 @@ namespace dxvk {
 
     // Copies are only supported if the sample count matches,
     // otherwise we need to resolve.
-    bool needsResolve = srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
-    bool fbBlit       = dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
-    fastPath &= !fbBlit;
+    auto needsResolve = false;
+    if (srcImage->info().sampleCount != dstImage->info().sampleCount) {
+      needsResolve = srcImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
+      auto fbBlit = dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
+      fastPath &= !fbBlit;
+    }
 
     // Copies would only work if we are block aligned.
     if (pSourceRect != nullptr) {
@@ -1552,7 +1558,7 @@ namespace dxvk {
         Rc<DxvkImageView> view = cImage->createView(viewKey);
 
         if (cOffset == VkOffset3D() && cExtent == cImage->mipLevelExtent(viewKey.mipIndex)) {
-          ctx->clearRenderTarget(view, cSubresource.aspectMask, cClearValue);
+          ctx->clearRenderTarget(view, cSubresource.aspectMask, cClearValue, 0u);
         } else {
           ctx->clearImageView(view, cOffset, cExtent,
             cSubresource.aspectMask, cClearValue);
@@ -1913,10 +1919,8 @@ namespace dxvk {
           cAspectMask = aspectMask,
           cImageView  = imageView
         ] (DxvkContext* ctx) {
-          ctx->clearRenderTarget(
-            cImageView,
-            cAspectMask,
-            cClearValue);
+          ctx->clearRenderTarget(cImageView,
+            cAspectMask, cClearValue, 0u);
         });
       }
       else {
@@ -2260,8 +2264,9 @@ namespace dxvk {
 
       states[State] = Value;
 
-      // AMD's driver hack for ATOC and RESZ
-      if (unlikely(State == D3DRS_POINTSIZE)) {
+      // AMD's driver hack for ATOC and RESZ.
+      if (unlikely(State == D3DRS_POINTSIZE &&
+                   m_vendorId == uint32_t(DxvkGpuVendor::Amd))) {
         // ATOC
         constexpr uint32_t AlphaToCoverageEnable  = uint32_t(D3D9Format::A2M1);
         constexpr uint32_t AlphaToCoverageDisable = uint32_t(D3D9Format::A2M0);
@@ -2290,8 +2295,10 @@ namespace dxvk {
         }
       }
 
-      // NV's driver hack for ATOC.
-      if (unlikely(State == D3DRS_ADAPTIVETESS_Y)) {
+      // Nvidia/Intel's driver hack for ATOC.
+      if (unlikely(State == D3DRS_ADAPTIVETESS_Y &&
+                   (m_vendorId == uint32_t(DxvkGpuVendor::Nvidia)
+                 || m_vendorId == uint32_t(DxvkGpuVendor::Intel)))) {
         constexpr uint32_t AlphaToCoverageEnable  = uint32_t(D3D9Format::ATOC);
         constexpr uint32_t AlphaToCoverageDisable = 0;
 
@@ -2648,13 +2655,21 @@ namespace dxvk {
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetClipStatus(const D3DCLIPSTATUS9* pClipStatus) {
-    Logger::warn("D3D9DeviceEx::SetClipStatus: Stub");
+    if (unlikely(pClipStatus == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    m_state.clipStatus = *pClipStatus;
+
     return D3D_OK;
   }
 
 
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::GetClipStatus(D3DCLIPSTATUS9* pClipStatus) {
-    Logger::warn("D3D9DeviceEx::GetClipStatus: Stub");
+    if (unlikely(pClipStatus == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    *pClipStatus = m_state.clipStatus;
+
     return D3D_OK;
   }
 
@@ -3011,7 +3026,7 @@ namespace dxvk {
     D3D9DeviceLock lock = LockDevice();
 
     if (unlikely(m_state.vertexDecl == nullptr))
-        return D3DERR_INVALIDCALL;
+      return D3DERR_INVALIDCALL;
 
     if (unlikely(!PrimitiveCount))
       return S_OK;
@@ -4508,6 +4523,11 @@ namespace dxvk {
 
   bool D3D9DeviceEx::SupportsSWVP() {
     return m_dxvkDevice->features().core.features.vertexPipelineStoresAndAtomics && m_dxvkDevice->features().vk12.shaderInt8;
+  }
+
+
+  bool D3D9DeviceEx::SupportsVCacheQuery() const {
+    return m_vendorId == uint32_t(DxvkGpuVendor::Nvidia);
   }
 
 
@@ -6803,14 +6823,27 @@ namespace dxvk {
   }
 
 
+  bool D3D9DeviceEx::IsAlphaToCoverageEnabled() const {
+    const bool alphaTest = m_state.renderStates[D3DRS_ALPHATESTENABLE] != 0;
+
+    const D3D9CommonTexture* rt0 = GetCommonTexture(m_state.renderTargets[0].ptr());
+    const bool isMultisampled = rt0 != nullptr && (
+      rt0->Desc()->MultiSample >= D3DMULTISAMPLE_2_SAMPLES
+      || (rt0->Desc()->MultiSample == D3DMULTISAMPLE_NONMASKABLE && rt0->Desc()->MultisampleQuality > 0)
+    );
+
+    return (m_amdATOC || (m_nvATOC && alphaTest)) && rt0 != nullptr && isMultisampled;
+  }
+
+
   void D3D9DeviceEx::BindMultiSampleState() {
     m_flags.clr(D3D9DeviceFlag::DirtyMultiSampleState);
 
-    DxvkMultisampleState msState;
-    msState.sampleMask = m_flags.test(D3D9DeviceFlag::ValidSampleMask)
-      ? m_state.renderStates[D3DRS_MULTISAMPLEMASK]
-      : 0xffffffff;
-    msState.enableAlphaToCoverage = IsAlphaToCoverageEnabled();
+    DxvkMultisampleState msState = { };
+    msState.setSampleMask(m_flags.test(D3D9DeviceFlag::ValidSampleMask)
+      ? uint16_t(m_state.renderStates[D3DRS_MULTISAMPLEMASK])
+      : uint16_t(0xffffu));
+    msState.setAlphaToCoverage(IsAlphaToCoverageEnabled());
 
     EmitCs([
       cState = msState
@@ -6825,71 +6858,66 @@ namespace dxvk {
 
     auto& state = m_state.renderStates;
 
-    bool separateAlpha = state[D3DRS_SEPARATEALPHABLENDENABLE];
+    DxvkBlendMode mode = { };
+    mode.setBlendEnable(state[D3DRS_ALPHABLENDENABLE]);
 
-    DxvkBlendMode mode;
-    mode.enableBlending = state[D3DRS_ALPHABLENDENABLE] != FALSE;
-
-    D3D9BlendState color, alpha;
+    D3D9BlendState color = { };
 
     color.Src = D3DBLEND(state[D3DRS_SRCBLEND]);
     color.Dst = D3DBLEND(state[D3DRS_DESTBLEND]);
     color.Op  = D3DBLENDOP(state[D3DRS_BLENDOP]);
     FixupBlendState(color);
 
-    if (separateAlpha) {
+    D3D9BlendState alpha = color;
+
+    if (state[D3DRS_SEPARATEALPHABLENDENABLE]) {
       alpha.Src = D3DBLEND(state[D3DRS_SRCBLENDALPHA]);
       alpha.Dst = D3DBLEND(state[D3DRS_DESTBLENDALPHA]);
       alpha.Op  = D3DBLENDOP(state[D3DRS_BLENDOPALPHA]);
       FixupBlendState(alpha);
     }
-    else
-      alpha = color;
 
-    mode.colorSrcFactor = DecodeBlendFactor(color.Src, false);
-    mode.colorDstFactor = DecodeBlendFactor(color.Dst, false);
-    mode.colorBlendOp   = DecodeBlendOp    (color.Op);
+    mode.setColorOp(DecodeBlendFactor(color.Src, false),
+                    DecodeBlendFactor(color.Dst, false),
+                    DecodeBlendOp(color.Op));
 
-    mode.alphaSrcFactor = DecodeBlendFactor(alpha.Src, true);
-    mode.alphaDstFactor = DecodeBlendFactor(alpha.Dst, true);
-    mode.alphaBlendOp   = DecodeBlendOp    (alpha.Op);
+    mode.setAlphaOp(DecodeBlendFactor(alpha.Src, true),
+                    DecodeBlendFactor(alpha.Dst, true),
+                    DecodeBlendOp(alpha.Op));
 
-    mode.writeMask = state[ColorWriteIndex(0)];
+    uint16_t writeMasks = 0;
 
-    std::array<VkColorComponentFlags, 3> extraWriteMasks;
-    for (uint32_t i = 0; i < 3; i++)
-      extraWriteMasks[i] = state[ColorWriteIndex(i + 1)];
+    for (uint32_t i = 0; i < 4; i++)
+      writeMasks |= (state[ColorWriteIndex(i)] & 0xfu) << (4u * i);
 
     EmitCs([
       cMode       = mode,
-      cWriteMasks = extraWriteMasks,
+      cWriteMasks = writeMasks,
       cAlphaMasks = m_alphaSwizzleRTs
     ](DxvkContext* ctx) {
       for (uint32_t i = 0; i < 4; i++) {
         DxvkBlendMode mode = cMode;
-        if (i != 0)
-          mode.writeMask = cWriteMasks[i - 1];
+        mode.setWriteMask(cWriteMasks >> (4u * i));
 
         // Adjust the blend factor based on the render target alpha swizzle bit mask.
         // Specific formats such as the XRGB ones require a ONE swizzle for alpha
         // which cannot be directly applied with the image view of the attachment.
-        const bool alphaSwizzle = cAlphaMasks & (1 << i);
-
-        auto NormalizeFactor = [alphaSwizzle](VkBlendFactor Factor) {
-          if (alphaSwizzle) {
+        if (cAlphaMasks & (1 << i)) {
+          auto NormalizeFactor = [] (VkBlendFactor Factor) {
             if (Factor == VK_BLEND_FACTOR_DST_ALPHA)
               return VK_BLEND_FACTOR_ONE;
             else if (Factor == VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA)
               return VK_BLEND_FACTOR_ZERO;
-          }
+            return Factor;
+          };
 
-          return Factor;
-        };
+          mode.setColorOp(NormalizeFactor(mode.colorSrcFactor()),
+                          NormalizeFactor(mode.colorDstFactor()), mode.colorBlendOp());
+          mode.setAlphaOp(NormalizeFactor(mode.alphaSrcFactor()),
+                          NormalizeFactor(mode.alphaDstFactor()), mode.alphaBlendOp());
+        }
 
-        mode.colorSrcFactor = NormalizeFactor(mode.colorSrcFactor);
-        mode.colorDstFactor = NormalizeFactor(mode.colorDstFactor);
-        mode.alphaSrcFactor = NormalizeFactor(mode.alphaSrcFactor);
-        mode.alphaDstFactor = NormalizeFactor(mode.alphaDstFactor);
+        mode.normalize();
 
         ctx->setBlendMode(i, mode);
       }
@@ -6919,39 +6947,42 @@ namespace dxvk {
     bool stencil            = rs[D3DRS_STENCILENABLE];
     bool twoSidedStencil    = stencil && rs[D3DRS_TWOSIDEDSTENCILMODE];
 
-    DxvkDepthStencilState state;
-    state.enableDepthTest   = rs[D3DRS_ZENABLE]       != FALSE;
-    state.enableDepthWrite  = rs[D3DRS_ZWRITEENABLE]  != FALSE;
-    state.enableStencilTest = stencil;
-    state.depthCompareOp    = DecodeCompareOp(D3DCMPFUNC(rs[D3DRS_ZFUNC]));
+    DxvkDepthStencilState state = { };
+    state.setDepthTest(rs[D3DRS_ZENABLE]);
+    state.setDepthWrite(rs[D3DRS_ZWRITEENABLE]);
+    state.setStencilTest(stencil);
+    state.setDepthCompareOp(DecodeCompareOp(D3DCMPFUNC(rs[D3DRS_ZFUNC])));
+
+    DxvkStencilOp frontOp = { };
 
     if (stencil) {
-      state.stencilOpFront.failOp      = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILFAIL]));
-      state.stencilOpFront.passOp      = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILPASS]));
-      state.stencilOpFront.depthFailOp = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILZFAIL]));
-      state.stencilOpFront.compareOp   = DecodeCompareOp(D3DCMPFUNC  (rs[D3DRS_STENCILFUNC]));
-      state.stencilOpFront.compareMask = uint32_t(rs[D3DRS_STENCILMASK]);
-      state.stencilOpFront.writeMask   = uint32_t(rs[D3DRS_STENCILWRITEMASK]);
-      state.stencilOpFront.reference   = 0;
+      frontOp.setFailOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILFAIL])));
+      frontOp.setPassOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILPASS])));
+      frontOp.setDepthFailOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_STENCILZFAIL])));
+      frontOp.setCompareOp(DecodeCompareOp(D3DCMPFUNC(rs[D3DRS_STENCILFUNC])));
+      frontOp.setCompareMask(rs[D3DRS_STENCILMASK]);
+      frontOp.setWriteMask(rs[D3DRS_STENCILWRITEMASK]);
     }
-    else
-      state.stencilOpFront = VkStencilOpState();
+
+    DxvkStencilOp backOp = frontOp;
 
     if (twoSidedStencil) {
-      state.stencilOpBack.failOp      = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILFAIL]));
-      state.stencilOpBack.passOp      = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILPASS]));
-      state.stencilOpBack.depthFailOp = DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILZFAIL]));
-      state.stencilOpBack.compareOp   = DecodeCompareOp(D3DCMPFUNC  (rs[D3DRS_CCW_STENCILFUNC]));
-      state.stencilOpBack.compareMask = state.stencilOpFront.compareMask;
-      state.stencilOpBack.writeMask   = state.stencilOpFront.writeMask;
-      state.stencilOpBack.reference   = 0;
+      backOp.setFailOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILFAIL])));
+      backOp.setPassOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILPASS])));
+      backOp.setDepthFailOp(DecodeStencilOp(D3DSTENCILOP(rs[D3DRS_CCW_STENCILZFAIL])));
+      backOp.setCompareOp(DecodeCompareOp(D3DCMPFUNC(rs[D3DRS_CCW_STENCILFUNC])));
+      backOp.setCompareMask(rs[D3DRS_STENCILMASK]);
+      backOp.setWriteMask(rs[D3DRS_STENCILWRITEMASK]);
     }
-    else
-      state.stencilOpBack = state.stencilOpFront;
+
+    state.setStencilOpFront(frontOp);
+    state.setStencilOpBack(backOp);
 
     EmitCs([
       cState = state
-    ](DxvkContext* ctx) {
+    ] (DxvkContext* ctx) mutable {
+      cState.normalize();
+
       ctx->setDepthStencilState(cState);
     });
   }
@@ -6963,12 +6994,12 @@ namespace dxvk {
     auto& rs = m_state.renderStates;
 
     DxvkRasterizerState state = { };
-    state.cullMode        = DecodeCullMode(D3DCULL(rs[D3DRS_CULLMODE]));
-    state.depthBiasEnable = IsDepthBiasEnabled();
-    state.depthClipEnable = true;
-    state.frontFace       = VK_FRONT_FACE_CLOCKWISE;
-    state.polygonMode     = DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE]));
-    state.flatShading     = m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT;
+    state.setCullMode(DecodeCullMode(D3DCULL(rs[D3DRS_CULLMODE])));
+    state.setDepthBias(IsDepthBiasEnabled());
+    state.setDepthClip(true);
+    state.setFrontFace(VK_FRONT_FACE_CLOCKWISE);
+    state.setPolygonMode(DecodeFillMode(D3DFILLMODE(rs[D3DRS_FILLMODE])));
+    state.setFlatShading(m_state.renderStates[D3DRS_SHADEMODE] == D3DSHADE_FLAT);
 
     EmitCs([
       cState  = state
@@ -7380,10 +7411,13 @@ namespace dxvk {
     if (unlikely(m_flags.test(D3D9DeviceFlag::DirtyDepthBounds))) {
       m_flags.clr(D3D9DeviceFlag::DirtyDepthBounds);
 
-      DxvkDepthBounds db;
+      DxvkDepthBounds db = { };
       db.enableDepthBounds  = (m_state.renderStates[D3DRS_ADAPTIVETESS_X] == uint32_t(D3D9Format::NVDB));
-      db.minDepthBounds     = bit::cast<float>(m_state.renderStates[D3DRS_ADAPTIVETESS_Z]);
-      db.maxDepthBounds     = bit::cast<float>(m_state.renderStates[D3DRS_ADAPTIVETESS_W]);
+
+      if (db.enableDepthBounds) {
+        db.minDepthBounds = std::clamp(bit::cast<float>(m_state.renderStates[D3DRS_ADAPTIVETESS_Z]), 0.0f, 1.0f);
+        db.maxDepthBounds = std::clamp(bit::cast<float>(m_state.renderStates[D3DRS_ADAPTIVETESS_W]), 0.0f, 1.0f);
+      }
 
       EmitCs([
         cDepthBounds = db
@@ -7522,8 +7556,9 @@ namespace dxvk {
 
         const auto& elements = cVertexDecl->GetElements();
 
-        std::array<DxvkVertexAttribute, 2 * caps::InputRegisterCount> attrList;
-        std::array<DxvkVertexBinding,   2 * caps::InputRegisterCount> bindList;
+        std::array<DxvkVertexInput, 2 * caps::InputRegisterCount> attrList = { };
+        std::array<DxvkVertexInput, 2 * caps::InputRegisterCount> bindList = { };
+        std::array<uint32_t, 2 * caps::InputRegisterCount> vertexSizes = { };
 
         uint32_t attrMask = 0;
         uint32_t bindMask = 0;
@@ -7535,7 +7570,7 @@ namespace dxvk {
         for (uint32_t i = 0; i < isgn.elemCount; i++) {
           const auto& decl = isgn.elems[i];
 
-          DxvkVertexAttribute attrib;
+          DxvkVertexAttribute attrib = { };
           attrib.location = i;
           attrib.binding  = NullStreamIdx;
           attrib.format   = VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -7556,28 +7591,26 @@ namespace dxvk {
             }
           }
 
-          attrList[i] = attrib;
+          attrList[i] = DxvkVertexInput(attrib);
 
-          DxvkVertexBinding binding;
+          vertexSizes[attrib.binding] = std::max(vertexSizes[attrib.binding],
+            uint32_t(attrib.offset + lookupFormatInfo(attrib.format)->elementSize));
+
+          DxvkVertexBinding binding = { };
           binding.binding = attrib.binding;
-          binding.extent = attrib.offset + lookupFormatInfo(attrib.format)->elementSize;
+          binding.extent = vertexSizes[attrib.binding];
 
           uint32_t instanceData = cStreamFreq[binding.binding % caps::MaxStreams];
           if (instanceData & D3DSTREAMSOURCE_INSTANCEDATA) {
-            binding.fetchRate = instanceData & 0x7FFFFF; // Remove instance packed-in flags in the data.
+            binding.divisor = instanceData & 0x7FFFFF; // Remove instance packed-in flags in the data.
             binding.inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
           }
           else {
-            binding.fetchRate = 0;
+            binding.divisor = 0u;
             binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
           }
 
-          if (bindMask & (1u << binding.binding)) {
-            bindList.at(binding.binding).extent = std::max(
-              bindList.at(binding.binding).extent, binding.extent);
-          } else {
-            bindList.at(binding.binding) = binding;
-          }
+          bindList[binding.binding] = DxvkVertexInput(binding);
 
           attrMask |= 1u << i;
           bindMask |= 1u << binding.binding;
