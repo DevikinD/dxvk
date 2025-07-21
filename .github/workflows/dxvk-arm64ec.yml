@@ -8,6 +8,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+        
     - name: Install llvm-mingw
       run: |
         sudo mkdir -p /opt
@@ -25,5 +31,10 @@ jobs:
           ./package-release.sh ${VERSION_NAME} build --no-package
           echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
 
-    - name: check
-      run: ls  -a
+    - name: Upload artifacts
+      id: upload-artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: dxvk-win-${{ env.VERSION_NAME }}
+        path: build/dxvk-${{ env.VERSION_NAME }}
+        if-no-files-found: error
