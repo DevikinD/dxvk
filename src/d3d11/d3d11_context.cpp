@@ -3402,13 +3402,12 @@ namespace dxvk {
         cDepthBias  = m_state.rs.state->GetDepthBias()
       ] (DxvkContext* ctx) {
         ctx->setRasterizerState(cState);
-
-        if (cState.depthBias())
-          ctx->setDepthBias(cDepthBias);
+        ctx->setDepthBias(cDepthBias);
       });
     } else {
       EmitCs([] (DxvkContext* ctx) {
         ctx->setRasterizerState(InitDefaultRasterizerState());
+        ctx->setDepthBias(DxvkDepthBias());
       });
     }
   }
@@ -3431,7 +3430,8 @@ namespace dxvk {
     EmitCs([
       cPushConstants = pc
     ] (DxvkContext* ctx) {
-      ctx->pushConstants(0, sizeof(cPushConstants), &cPushConstants);
+      ctx->pushData(VK_SHADER_STAGE_ALL_GRAPHICS,
+        0, sizeof(cPushConstants), &cPushConstants);
     });
   }
 
@@ -3653,17 +3653,13 @@ namespace dxvk {
     // target bindings are updated. Set up the attachments.
     for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
       if (m_state.om.rtvs[i] != nullptr) {
-        attachments.color[i] = {
-          m_state.om.rtvs[i]->GetImageView(),
-          m_state.om.rtvs[i]->GetRenderLayout() };
+        attachments.color[i].view = m_state.om.rtvs[i]->GetImageView();
         sampleCount = m_state.om.rtvs[i]->GetSampleCount();
       }
     }
 
     if (m_state.om.dsv != nullptr) {
-      attachments.depth = {
-        m_state.om.dsv->GetImageView(),
-        m_state.om.dsv->GetRenderLayout() };
+      attachments.depth.view = m_state.om.dsv->GetImageView();
       sampleCount = m_state.om.dsv->GetSampleCount();
 
       if (m_device->features().extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
@@ -4813,6 +4809,7 @@ namespace dxvk {
       ctx->setInputAssemblyState(InitDefaultPrimitiveTopology());
       ctx->setDepthStencilState(InitDefaultDepthStencilState());
       ctx->setRasterizerState(InitDefaultRasterizerState());
+      ctx->setDepthBias(DxvkDepthBias());
       ctx->setLogicOpState(InitDefaultLogicOpState());
       ctx->setMultisampleState(InitDefaultMultisampleState(D3D11_DEFAULT_SAMPLE_MASK));
 
@@ -4894,7 +4891,7 @@ namespace dxvk {
       // Initialize push constants
       DxbcPushConstants pc;
       pc.rasterizerSampleCount = 1;
-      ctx->pushConstants(0, sizeof(pc), &pc);
+      ctx->pushData(VK_SHADER_STAGE_ALL_GRAPHICS, 0, sizeof(pc), &pc);
     });
   }
 
@@ -5777,7 +5774,8 @@ namespace dxvk {
       }
 
       // Otherwise we can't really do anything fancy, so just do a GPU copy
-      context->UpdateBuffer(bufferResource, offset, length, pSrcData);
+      if (likely(length))
+        context->UpdateBuffer(bufferResource, offset, length, pSrcData);
     } else {
       D3D11CommonTexture* textureResource = GetCommonTexture(pDstResource);
 
@@ -5876,7 +5874,6 @@ namespace dxvk {
     rsState.setCullMode(VK_CULL_MODE_BACK_BIT);
     rsState.setFrontFace(VK_FRONT_FACE_CLOCKWISE);
     rsState.setDepthClip(true);
-    rsState.setDepthBias(false);
     rsState.setConservativeMode(VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT);
     rsState.setSampleCount(0);
     rsState.setFlatShading(false);
