@@ -27,9 +27,13 @@ jobs:
     
     - name: Build dxvk-arm64ec
       run: |
-        export VERSION_NAME="${GITHUB_REF##*/}-${GITHUB_SHA##*/}"
-          ./package-release.sh ${VERSION_NAME} build --no-package
-          echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
+        if git describe --tags --exact-match >/dev/null 2>&1; then
+        export VERSION_NAME="$(git describe --tags)"
+        else
+        export VERSION_NAME="commit-${GITHUB_SHA:0:8}"
+        fi
+        ./package-release.sh ${VERSION_NAME} build --no-package
+        echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
 
     - name: Upload artifacts
       id: upload-artifacts
