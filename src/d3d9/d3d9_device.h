@@ -80,7 +80,6 @@ namespace dxvk {
     DirtyFFPixelShader,
     DirtyFFViewport,
     DirtyFFPixelData,
-    DirtyProgVertexShader,
     DirtySharedPixelShaderData,
     ValidSampleMask,
     DirtyDepthBounds,
@@ -940,7 +939,7 @@ namespace dxvk {
 
     void UpdateTextureBitmasks(uint32_t index, DWORD combinedUsage);
 
-    void UpdateActiveHazardsRT(uint32_t rtMask, uint32_t texMask);
+    void UpdateActiveHazardsRT(uint32_t texMask);
 
     void UpdateActiveHazardsDS(uint32_t texMask);
 
@@ -1004,8 +1003,6 @@ namespace dxvk {
 
     void BindViewportAndScissor();
 
-    bool IsAlphaToCoverageEnabled() const;
-
     inline bool IsNVDepthBoundsTestEnabled () {
       // NVDB is not supported by D3D8
       if (unlikely(m_isD3D8Compatible))
@@ -1014,9 +1011,7 @@ namespace dxvk {
       return m_state.renderStates[D3DRS_ADAPTIVETESS_X] == uint32_t(D3D9Format::NVDB);
     }
 
-    inline bool IsAlphaTestEnabled() {
-      return m_state.renderStates[D3DRS_ALPHATESTENABLE] && !m_atocEnabled;
-    }
+    void UpdateAlphaToCoverangeAndAlphaTest();
 
     inline bool IsZTestEnabled() {
       return m_state.renderStates[D3DRS_ZENABLE] && m_state.depthStencil != nullptr;
@@ -1030,7 +1025,7 @@ namespace dxvk {
 
     void BindDepthStencilState();
 
-    void BindDepthStencilRefrence();
+    void BindDepthStencilReference();
 
     void BindRasterizerState();
 
@@ -1095,7 +1090,10 @@ namespace dxvk {
 
     template <DxsoProgramType ShaderStage>
     void BindShader(
-      const D3D9CommonShader*                 pShaderModule);
+    const D3D9CommonShader*                 pShaderModule);
+
+    template <DxsoProgramType ShaderStage>
+    void BindFFUbershader();
 
     void BindInputLayout();
 
@@ -1372,7 +1370,7 @@ namespace dxvk {
 
       switch (ConstantType) {
         default:
-        case D3D9ConstantType::Float:  return isVS ? caps::MaxFloatConstantsSoftware : caps::MaxFloatConstantsPS;
+        case D3D9ConstantType::Float:  return isVS ? caps::MaxFloatConstantsSoftware : caps::MaxSM3FloatConstantsPS;
         case D3D9ConstantType::Int:    return isVS ? caps::MaxOtherConstantsSoftware : caps::MaxOtherConstants;
         case D3D9ConstantType::Bool:   return isVS ? caps::MaxOtherConstantsSoftware : caps::MaxOtherConstants;
       }
@@ -1483,10 +1481,13 @@ namespace dxvk {
     void UpdateAlphaTestSpec(VkCompareOp alphaOp, uint32_t precision);
     void UpdateVertexBoolSpec(uint32_t value);
     void UpdatePixelBoolSpec(uint32_t value);
-    void UpdatePixelShaderSamplerSpec(uint32_t types, uint32_t projections, uint32_t fetch4);
-    void UpdateCommonSamplerSpec(uint32_t boundMask, uint32_t depthMask, uint32_t drefMask);
+    void UpdatePixelShaderSamplerSpec(uint32_t types, uint32_t fetch4);
+    void UpdateCommonSamplerSpec(uint32_t boundMask, uint32_t depthMask, uint32_t drefMask, uint32_t projections);
     void UpdatePointModeSpec(uint32_t mode);
     void UpdateFogModeSpec(bool fogEnabled, D3DFOGMODE vertexFogMode, D3DFOGMODE pixelFogMode);
+
+    D3D9FFShaderKeyVS BuildFFKeyVS(D3D9FF_VertexBlendMode vertexBlendMode, bool indexedVertexBlend) const;
+    D3D9FFShaderKeyFS BuildFFKeyFS() const;
 
     void BindSpecConstants();
 

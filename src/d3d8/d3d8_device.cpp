@@ -47,7 +47,7 @@ namespace dxvk {
     , m_behaviorFlags(BehaviorFlags)
     , m_multithread(BehaviorFlags & D3DCREATE_MULTITHREADED) {
     // Get the bridge interface to D3D9.
-    if (FAILED(GetD3D9()->QueryInterface(__uuidof(IDxvkD3D8Bridge), reinterpret_cast<void**>(&m_bridge)))) {
+    if (unlikely(FAILED(GetD3D9()->QueryInterface(__uuidof(IDxvkD3D8Bridge), reinterpret_cast<void**>(&m_bridge))))) {
       throw DxvkError("D3D8Device: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
     }
 
@@ -56,12 +56,6 @@ namespace dxvk {
 
     if (m_d3d8Options.batching)
       m_batcher = new D3D8Batcher(this, GetD3D9());
-
-    d3d9::D3DCAPS9 caps9;
-    HRESULT res = GetD3D9()->GetDeviceCaps(&caps9);
-
-    if (unlikely(SUCCEEDED(res) && caps9.PixelShaderVersion == D3DPS_VERSION(0, 0)))
-      m_isFixedFunctionOnly = true;
   }
 
   D3D8Device::~D3D8Device() {
@@ -162,6 +156,7 @@ namespace dxvk {
       return D3DERR_INVALIDCALL;
 
     *ppD3D8 = m_parent.ref();
+
     return D3D_OK;
   }
 
@@ -229,29 +224,18 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D8Device::Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) {
     D3D8DeviceLock lock = LockDevice();
 
+    HRESULT res = m_parent->ValidatePresentationParameters(pPresentationParameters);
+
+    if (unlikely(FAILED(res)))
+      return res;
+
     StateChange();
-
-    if (unlikely(pPresentationParameters == nullptr))
-      return D3DERR_INVALIDCALL;
-
-    // D3DSWAPEFFECT_COPY can not be used with more than one back buffer.
-    // This is also technically true for D3DSWAPEFFECT_COPY_VSYNC, however
-    // RC Cars depends on it not being rejected.
-    if (unlikely(pPresentationParameters->SwapEffect == D3DSWAPEFFECT_COPY
-              && pPresentationParameters->BackBufferCount > 1))
-      return D3DERR_INVALIDCALL;
-
-    // In D3D8 nothing except D3DPRESENT_INTERVAL_DEFAULT can be used
-    // as a flag for windowed presentation.
-    if (unlikely(pPresentationParameters->Windowed
-              && pPresentationParameters->FullScreen_PresentationInterval != D3DPRESENT_INTERVAL_DEFAULT))
-      return D3DERR_INVALIDCALL;
 
     m_presentParams = *pPresentationParameters;
     ResetState();
 
     d3d9::D3DPRESENT_PARAMETERS params = ConvertPresentParameters9(pPresentationParameters);
-    HRESULT res = GetD3D9()->Reset(&params);
+    res = GetD3D9()->Reset(&params);
 
     if (likely(SUCCEEDED(res)))
       RecreateBackBuffersAndAutoDepthStencil();
@@ -295,6 +279,7 @@ namespace dxvk {
     }
 
     *ppBackBuffer = m_backBuffers[iBackBuffer].ref();
+
     return D3D_OK;
   }
 
@@ -439,7 +424,7 @@ namespace dxvk {
     if (unlikely(ppVertexBuffer == nullptr))
       return D3DERR_INVALIDCALL;
 
-    if (ShouldBatch()) {
+    if (unlikely(ShouldBatch())) {
       *ppVertexBuffer = m_batcher->CreateVertexBuffer(Length, Usage, FVF, Pool);
       return D3D_OK;
     }
@@ -1156,31 +1141,34 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D8Device::SetViewport(const D3DVIEWPORT8* pViewport) {
     D3D8DeviceLock lock = LockDevice();
 
-    if (likely(pViewport != nullptr)) {
-      // We need a valid render target to validate the viewport
-      if (unlikely(m_renderTarget == nullptr))
+    // Outright crashes on native, but let's be
+    // somewhat more elegant about it.
+    if (unlikely(pViewport == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // We need a valid render target to validate the viewport
+    if (unlikely(m_renderTarget == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    D3DSURFACE_DESC rtDesc;
+    HRESULT res = m_renderTarget->GetDesc(&rtDesc);
+
+    // D3D8 will fail when setting a viewport that's outside of the
+    // current render target, although this apparently works in D3D9
+    if (likely(SUCCEEDED(res)) &&
+        unlikely(pViewport->X + pViewport->Width  > rtDesc.Width ||
+                 pViewport->Y + pViewport->Height > rtDesc.Height)) {
+      // On Linux/Wine and in windowed mode, we can get in situations
+      // where the actual render target dimensions are off by one
+      // pixel to what the game sets them to. Allow this corner case
+      // to skip the validation, in order to prevent issues.
+      const bool isOnePixelWider  = pViewport->X + pViewport->Width  == rtDesc.Width  + 1;
+      const bool isOnePixelTaller = pViewport->Y + pViewport->Height == rtDesc.Height + 1;
+
+      if (unlikely(m_presentParams.Windowed && (isOnePixelWider || isOnePixelTaller))) {
+        Logger::debug("D3D8Device::SetViewport: Viewport exceeds render target dimensions by one pixel");
+      } else {
         return D3DERR_INVALIDCALL;
-
-      D3DSURFACE_DESC rtDesc;
-      HRESULT res = m_renderTarget->GetDesc(&rtDesc);
-
-      // D3D8 will fail when setting a viewport that's outside of the
-      // current render target, although this apparently works in D3D9
-      if (likely(SUCCEEDED(res)) &&
-          unlikely(pViewport->X + pViewport->Width  > rtDesc.Width ||
-                   pViewport->Y + pViewport->Height > rtDesc.Height)) {
-        // On Linux/Wine and in windowed mode, we can get in situations
-        // where the actual render target dimensions are off by one
-        // pixel to what the game sets them to. Allow this corner case
-        // to skip the validation, in order to prevent issues.
-        const bool isOnePixelWider  = pViewport->X + pViewport->Width  == rtDesc.Width  + 1;
-        const bool isOnePixelTaller = pViewport->Y + pViewport->Height == rtDesc.Height + 1;
-
-        if (m_presentParams.Windowed && (isOnePixelWider || isOnePixelTaller)) {
-          Logger::debug("D3D8Device::SetViewport: Viewport exceeds render target dimensions by one pixel");
-        } else {
-          return D3DERR_INVALIDCALL;
-        }
       }
     }
 
@@ -1248,7 +1236,7 @@ namespace dxvk {
       m_token++;
       auto stateBlockIterPair = m_stateBlocks.emplace(std::piecewise_construct,
                                                       std::forward_as_tuple(m_token),
-                                                      std::forward_as_tuple(this, Type, pStateBlock9.ref()));
+                                                      std::forward_as_tuple(this, Type, pStateBlock9.ptr()));
       *pToken = m_token;
 
       // D3D8 state blocks automatically capture state on creation.
@@ -1491,7 +1479,7 @@ namespace dxvk {
           UINT             PrimitiveCount) {
     D3D8DeviceLock lock = LockDevice();
 
-    if (ShouldBatch())
+    if (unlikely(ShouldBatch()))
       return m_batcher->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     return GetD3D9()->DrawPrimitive(d3d9::D3DPRIMITIVETYPE(PrimitiveType), StartVertex, PrimitiveCount);
   }
@@ -1603,7 +1591,7 @@ namespace dxvk {
     HRESULT res = GetD3D9()->SetStreamSource(StreamNumber, D3D8VertexBuffer::GetD3D9Nullable(buffer), 0, Stride);
 
     if (likely(SUCCEEDED(res))) {
-      if (ShouldBatch())
+      if (unlikely(ShouldBatch()))
         m_batcher->SetStream(StreamNumber, buffer, Stride);
 
       m_streams[StreamNumber].buffer = buffer;
@@ -1649,17 +1637,16 @@ namespace dxvk {
     if (unlikely(BaseVertexIndex > std::numeric_limits<int32_t>::max()))
       Logger::warn("D3D8Device::SetIndices: BaseVertexIndex exceeds INT_MAX");
 
-    // used by DrawIndexedPrimitive
-    m_baseVertexIndex = BaseVertexIndex;
-
     D3D8IndexBuffer* buffer = static_cast<D3D8IndexBuffer*>(pIndexData);
     HRESULT res = GetD3D9()->SetIndices(D3D8IndexBuffer::GetD3D9Nullable(buffer));
 
     if (likely(SUCCEEDED(res))) {
-      if (ShouldBatch())
-        m_batcher->SetIndices(buffer, m_baseVertexIndex);
+      if (unlikely(ShouldBatch()))
+        m_batcher->SetIndices(buffer, BaseVertexIndex);
 
       m_indices = buffer;
+      // used by DrawIndexedPrimitive
+      m_baseVertexIndex = BaseVertexIndex;
     }
 
     return res;
@@ -1735,6 +1722,7 @@ namespace dxvk {
 
         if (!std::exchange(s_linePatternErrorShown, true))
           Logger::warn("D3D8Device::SetRenderState: Unimplemented render state D3DRS_LINEPATTERN");
+
         m_linePattern = bit::cast<D3DLINEPATTERN>(Value);
         return D3D_OK;
 
@@ -1770,8 +1758,8 @@ namespace dxvk {
 
         if (!std::exchange(s_patchSegmentsErrorShown, true))
           Logger::warn("D3D8Device::SetRenderState: Unimplemented render state D3DRS_PATCHSEGMENTS");
-        m_patchSegments = bit::cast<float>(Value);
-        return D3D_OK;
+
+        return GetD3D9()->SetNPatchMode(bit::cast<float>(Value));
     }
 
     // Skip GetRenderState() calls for state
@@ -1827,7 +1815,8 @@ namespace dxvk {
         return D3D_OK;
 
       case D3DRS_PATCHSEGMENTS:
-        *pValue = bit::cast<DWORD>(m_patchSegments);
+        const float patchSegments = GetD3D9()->GetNPatchMode();
+        *pValue = bit::cast<DWORD>(patchSegments);
         return D3D_OK;
     }
 

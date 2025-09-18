@@ -11,12 +11,7 @@ namespace dxvk {
 
   DxbcOptions::DxbcOptions(const Rc<DxvkDevice>& device, const D3D11Options& options) {
     const Rc<DxvkAdapter> adapter = device->adapter();
-
-    const DxvkDeviceFeatures& devFeatures = device->features();
     const DxvkDeviceInfo& devInfo = device->properties();
-
-    useDepthClipWorkaround
-      = !devFeatures.extDepthClipEnable.depthClipEnable;
 
     VkFormatFeatureFlags2 r32Features
       = device->getFormatFeatures(VK_FORMAT_R32_SFLOAT).optimal
@@ -47,9 +42,7 @@ namespace dxvk {
     needsPointSizeExport = device->adapter()->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA, Version(), Version(25, 0, 3));
 
     // Intel's hardware sin/cos is so inaccurate that it causes rendering issues in some games
-    sincosEmulation = device->adapter()->matchesDriver(VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
-                   || device->adapter()->matchesDriver(VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS);
-    applyTristate(sincosEmulation, options.sincosEmulation);
+    sincosEmulation = device->getShaderCompileOptions().flags.test(DxvkShaderCompileFlag::LowerSinCos);
 
     // Figure out float control flags to match D3D11 rules
     if (options.floatControls) {

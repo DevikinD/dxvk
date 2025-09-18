@@ -28,7 +28,7 @@ namespace dxvk {
 
       m_features.set(DxvkContextFeature::DescriptorBuffer);
     } else {
-      m_descriptorManager = new DxvkDescriptorPoolSet(device.ptr());
+      m_descriptorPool = new DxvkDescriptorPool(device.ptr());
     }
 
     // Init framebuffer info with default render pass in case
@@ -90,8 +90,6 @@ namespace dxvk {
 
     m_implicitResolves.cleanup(m_trackingId);
 
-    this->submitDescriptorPool(false);
-
     if (unlikely(m_features.test(DxvkContextFeature::DebugUtils))) {
       // Make sure to emit the submission reason always at the very end
       if (reason && reason->pLabelName && reason->pLabelName[0])
@@ -104,8 +102,6 @@ namespace dxvk {
 
 
   void DxvkContext::endFrame() {
-    this->submitDescriptorPool(true);
-
     m_renderPassIndex = 0u;
   }
 
@@ -1328,9 +1324,13 @@ namespace dxvk {
     renderingInfo.pColorAttachments = &attachmentInfo;
     
     // Retrieve a compatible pipeline to use for rendering
+    auto resolveMode = filter == VK_FILTER_NEAREST
+      ? DxvkMetaBlitResolveMode::FilterNearest
+      : DxvkMetaBlitResolveMode::FilterLinear;
+
     DxvkMetaBlitPipeline pipeInfo = m_common->metaBlit().getPipeline(
       mipGenerator.getSrcViewType(), imageView->info().format,
-      VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, filter);
+      VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, resolveMode);
 
     for (uint32_t i = 0; i < mipGenerator.getPassCount(); i++) {
       // Image view to read from
@@ -2126,7 +2126,8 @@ namespace dxvk {
       
       if ((clearAspects | discardAspects) & VK_IMAGE_ASPECT_COLOR_BIT) {
         clearStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        clearAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        clearAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                    |  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
 
         attachmentInfo.loadOp = colorOp.loadOp;
 
@@ -2141,7 +2142,8 @@ namespace dxvk {
       } else {
         clearStages |= VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
                     |  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        clearAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        clearAccess |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                    |  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 
         if (imageView->info().aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
           renderingInfo.pDepthAttachment = &attachmentInfo;
@@ -3344,6 +3346,21 @@ namespace dxvk {
       uint32_t(dstOffsetsAdjusted[1].y - dstOffsetsAdjusted[0].y),
       uint32_t(dstOffsetsAdjusted[1].z - dstOffsetsAdjusted[0].z) };
 
+    // Determine resolve mode for when the source is multisampled. If
+    // there is no stretching going on, do a regular resolve.
+    auto resolveMode = filter == VK_FILTER_NEAREST
+      ? DxvkMetaBlitResolveMode::FilterNearest
+      : DxvkMetaBlitResolveMode::FilterLinear;
+
+    if (srcView->image()->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      bool isSameExtent = (std::abs(dstOffsets[1].x - dstOffsets[0].x) == std::abs(srcOffsets[1].x - srcOffsets[0].x))
+                       && (std::abs(dstOffsets[1].y - dstOffsets[0].y) == std::abs(srcOffsets[1].y - srcOffsets[0].y))
+                       && (std::abs(dstOffsets[1].z - dstOffsets[0].z) == std::abs(srcOffsets[1].z - srcOffsets[0].z));
+
+      if (isSameExtent)
+        resolveMode = DxvkMetaBlitResolveMode::ResolveAverage;
+    }
+
     // Begin render pass
     VkExtent3D imageExtent = dstView->mipLevelExtent(0);
 
@@ -3367,7 +3384,7 @@ namespace dxvk {
     DxvkMetaBlitPipeline pipeInfo = m_common->metaBlit().getPipeline(
       dstView->info().viewType, dstView->info().format,
       srcView->image()->info().sampleCount,
-      dstView->image()->info().sampleCount, filter);
+      dstView->image()->info().sampleCount, resolveMode);
 
     // Set up viewport
     VkViewport viewport;
@@ -4118,7 +4135,7 @@ namespace dxvk {
     if (attachmentIndex < 0) {
       this->spillRenderPass(true);
 
-      this->prepareImage(imageView->image(), imageView->imageSubresources());
+      this->prepareImage(imageView->image(), imageView->imageSubresources(), true);
       this->flushPendingAccesses(*imageView->image(), imageView->imageSubresources(), DxvkAccess::Write);
 
       if (unlikely(m_features.test(DxvkContextFeature::DebugUtils))) {
@@ -4173,6 +4190,9 @@ namespace dxvk {
       // Make sure the render pass is active so
       // that we can actually perform the clear
       this->startRenderPass();
+
+      if (findOverlappingDeferredClear(imageView->image(), imageView->imageSubresources()))
+        flushClearsInline();
 
       if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
         uint32_t colorIndex = m_state.om.framebufferInfo.getColorAttachmentIndex(attachmentIndex);
@@ -5530,20 +5550,12 @@ namespace dxvk {
       VkImageLayout layout = depthAttachment.view->getLayout();
 
       if (layout != ops.depthOps.loadLayout) {
-        VkImageAspectFlags depthAspects = depthAttachment.view->info().aspects;
-
         VkPipelineStageFlags2 depthStages =
           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-        VkAccessFlags2 depthAccess = VK_ACCESS_2_NONE;
+        VkAccessFlags2 depthAccess = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 
-        if (((depthAspects & VK_IMAGE_ASPECT_DEPTH_BIT) && ops.depthOps.loadOpD == VK_ATTACHMENT_LOAD_OP_LOAD)
-         || ((depthAspects & VK_IMAGE_ASPECT_STENCIL_BIT) && ops.depthOps.loadOpS == VK_ATTACHMENT_LOAD_OP_LOAD))
-          depthAccess |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
-
-        if (((depthAspects & VK_IMAGE_ASPECT_DEPTH_BIT) && ops.depthOps.loadOpD != VK_ATTACHMENT_LOAD_OP_LOAD)
-         || ((depthAspects & VK_IMAGE_ASPECT_STENCIL_BIT) && ops.depthOps.loadOpS != VK_ATTACHMENT_LOAD_OP_LOAD)
-         || (layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL))
+        if (layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
           depthAccess |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
         if (layout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
@@ -5567,10 +5579,8 @@ namespace dxvk {
         VkImageLayout layout = colorAttachment.view->getLayout();
 
         if (layout != ops.colorOps[i].loadLayout) {
-          VkAccessFlags2 colorAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-
-          if (ops.colorOps[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
-            colorAccess |= VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
+          VkAccessFlags2 colorAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+                                     | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT;
 
           accessImage(DxvkCmdBuffer::ExecBuffer,
             *colorAttachment.view->image(),
@@ -6279,7 +6289,7 @@ namespace dxvk {
       constexpr bool useDescriptorTemplates = env::is32BitHostPlatform();
 
       std::array<VkDescriptorSet, DxvkDescriptorSets::SetCount> sets = { };
-      m_descriptorPool->alloc(pipelineLayout, dirtySetMask, sets.data());
+      m_descriptorPool->alloc(m_trackingId, pipelineLayout, dirtySetMask, sets.data());
 
       uint32_t descriptorCount = 0;
 
@@ -6987,15 +6997,9 @@ namespace dxvk {
       m_renderPassBarrierSrc.access |= VK_ACCESS_INDEX_READ_BIT;
 
       m_cmd->track(m_state.vi.indexBuffer.buffer(), DxvkAccess::Read);
-    } else if (m_device->features().khrMaintenance6.maintenance6) {
+    } else {
       // Bind null index buffer to read all zeroes, not too useful but well-defined
       m_cmd->cmdBindIndexBuffer2(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE, m_state.vi.indexType);
-    } else {
-      // Bind dummy buffer that contains all zeroes
-      auto bufferInfo = m_common->dummyResources().bufferInfo();
-
-      m_cmd->cmdBindIndexBuffer2(bufferInfo.buffer,
-        bufferInfo.offset, bufferInfo.size, m_state.vi.indexType);
     }
   }
   
@@ -7074,7 +7078,7 @@ namespace dxvk {
   
   
   void DxvkContext::updateTransformFeedbackBuffers() {
-    const auto& gsInfo = m_state.gp.shaders.gs->info();
+    const auto& gsInfo = m_state.gp.shaders.gs->metadata();
 
     VkBuffer     xfbBuffers[MaxNumXfbBuffers];
     VkDeviceSize xfbOffsets[MaxNumXfbBuffers];
@@ -8128,11 +8132,6 @@ namespace dxvk {
     if (resourceList.empty())
       return;
 
-    if (unlikely(m_features.test(DxvkContextFeature::DebugUtils))) {
-      m_cmd->cmdBeginDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer,
-        vk::makeLabel(0xc0a2f0, "Memory defrag"));
-    }
-
     std::vector<DxvkRelocateBufferInfo> bufferInfos;
     std::vector<DxvkRelocateImageInfo> imageInfos;
 
@@ -8165,6 +8164,11 @@ namespace dxvk {
     // If there are any resources to relocate, we have to stall the transfer
     // queue so that subsequent resource uploads do not overlap with resource
     // copies on the graphics timeline.
+    if (unlikely(m_features.test(DxvkContextFeature::DebugUtils))) {
+      m_cmd->cmdBeginDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer,
+        vk::makeLabel(0xc0a2f0, "Memory defrag"));
+    }
+
     relocateResources(
       bufferInfos.size(), bufferInfos.data(),
       imageInfos.size(), imageInfos.data());
@@ -8357,10 +8361,7 @@ namespace dxvk {
     if (m_features.test(DxvkContextFeature::DescriptorBuffer)) {
       m_cmd->setDescriptorHeap(m_descriptorHeap);
     } else {
-      if (!m_descriptorPool)
-        m_descriptorPool = m_descriptorManager->getDescriptorPool();
-
-      m_cmd->setDescriptorPool(m_descriptorPool, m_descriptorManager);
+      m_cmd->setDescriptorPool(m_descriptorPool);
     }
   }
 
@@ -9372,15 +9373,6 @@ namespace dxvk {
   void DxvkContext::endActiveDebugRegions() {
     for (size_t i = 0; i < m_debugLabelStack.size(); i++)
       m_cmd->cmdEndDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer);
-  }
-
-
-  void DxvkContext::submitDescriptorPool(bool endFrame) {
-    // Only relevant for the legacy descriptor model
-    if (m_descriptorPool && m_descriptorPool->shouldSubmit(endFrame)) {
-      m_descriptorPool = m_descriptorManager->getDescriptorPool();
-      m_cmd->setDescriptorPool(m_descriptorPool, m_descriptorManager);
-    }
   }
 
 }

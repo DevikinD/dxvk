@@ -49,10 +49,10 @@ namespace dxvk {
     HANDLE_EXT(khrPipelineLibrary);                \
     HANDLE_EXT(khrPresentId);                      \
     HANDLE_EXT(khrPresentWait);                    \
+    HANDLE_EXT(khrShaderFloatControls2);           \
     HANDLE_EXT(khrSwapchain);                      \
     HANDLE_EXT(khrSwapchainMutableFormat);         \
     HANDLE_EXT(khrWin32KeyedMutex);                \
-    HANDLE_EXT(nvDescriptorPoolOverallocation);    \
     HANDLE_EXT(nvLowLatency2);                     \
     HANDLE_EXT(nvRawAccessChains);                 \
     HANDLE_EXT(nvxBinaryImport);                   \
@@ -487,10 +487,6 @@ namespace dxvk {
     if (m_featuresSupported.extRobustness2.robustImageAccess2)
       m_featuresSupported.vk13.robustImageAccess = VK_FALSE;
 
-    // If descriptor buffers are used, disable legacy descriptor model extensions
-    if (m_featuresSupported.extDescriptorBuffer.descriptorBuffer)
-      m_featuresSupported.nvDescriptorPoolOverallocation.descriptorPoolOverallocation = VK_FALSE;
-
     // Vertex attribute divisor is unusable before spec version 3
     if (m_extensionsSupported.extVertexAttributeDivisor.specVersion < 3u) {
       m_featuresSupported.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor = VK_FALSE;
@@ -507,9 +503,6 @@ namespace dxvk {
     // Sanitize features with other feature dependencies
     if (!m_featuresSupported.core.features.shaderInt16)
       m_featuresSupported.vk11.storagePushConstant16 = VK_FALSE;
-
-    if (!m_featuresSupported.extDepthClipEnable.depthClipEnable)
-      m_featuresSupported.extExtendedDynamicState3.extendedDynamicState3DepthClipEnable = VK_FALSE;
   }
 
 
@@ -762,6 +755,8 @@ namespace dxvk {
       ENABLE_FEATURE(vk12, runtimeDescriptorArray, true),
       ENABLE_FEATURE(vk12, samplerFilterMinmax, false),
       ENABLE_FEATURE(vk12, samplerMirrorClampToEdge, true),
+      ENABLE_FEATURE(vk12, scalarBlockLayout, true),
+      ENABLE_FEATURE(vk12, shaderFloat16, false),
       ENABLE_FEATURE(vk12, shaderInt8, false),
       ENABLE_FEATURE(vk12, shaderOutputViewportIndex, false),
       ENABLE_FEATURE(vk12, shaderOutputLayer, false),
@@ -788,7 +783,7 @@ namespace dxvk {
       ENABLE_EXT_FEATURE(extCustomBorderColor, customBorderColorWithoutFormat, false),
 
       /* Depth clip matches D3D semantics where depth clamp does not */
-      ENABLE_EXT_FEATURE(extDepthClipEnable, depthClipEnable, false),
+      ENABLE_EXT_FEATURE(extDepthClipEnable, depthClipEnable, true),
 
       /* Controls depth bias behaviour with emulated depth formats */
       ENABLE_EXT_FEATURE(extDepthBiasControl, depthBiasControl, false),
@@ -871,7 +866,7 @@ namespace dxvk {
 
       /* Maintenance features, relied on in various parts of the code */
       ENABLE_EXT_FEATURE(khrMaintenance5, maintenance5, true),
-      ENABLE_EXT_FEATURE(khrMaintenance6, maintenance6, false),
+      ENABLE_EXT_FEATURE(khrMaintenance6, maintenance6, true),
       ENABLE_EXT_FEATURE(khrMaintenance7, maintenance7, false),
 
       /* Dependency for graphics pipeline library */
@@ -881,6 +876,9 @@ namespace dxvk {
       ENABLE_EXT_FEATURE(khrPresentId, presentId, false),
       ENABLE_EXT_FEATURE(khrPresentWait, presentWait, false),
 
+      /* Used for shader compilation in addition to regular float_controls features */
+      ENABLE_EXT_FEATURE(khrShaderFloatControls2, shaderFloatControls2, false),
+
       /* Swapchain, needed for presentation */
       ENABLE_EXT(khrSwapchain, true),
 
@@ -889,9 +887,6 @@ namespace dxvk {
 
       /* Keyed mutex support in wine */
       ENABLE_EXT(khrWin32KeyedMutex, false),
-
-      /* Descriptor pool overallocation, reduces descriptor pool spam in legacy model */
-      ENABLE_EXT_FEATURE(nvDescriptorPoolOverallocation, descriptorPoolOverallocation, false),
 
       /* Reflex support */
       ENABLE_EXT(nvLowLatency2, false),
