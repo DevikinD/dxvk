@@ -27,7 +27,7 @@ jobs:
     
     - name: Build dxvk-arm64ec
       run: |
-        export VERSION_NAME="$(date +'%Y%m%d')-${GITHUB_SHA:0:8}"
+        export VERSION_NAME="v2.7.1-554b4e1"
         ./package-release.sh ${VERSION_NAME} build --no-package
         echo "VERSION_NAME=${VERSION_NAME}" >> $GITHUB_ENV
 
